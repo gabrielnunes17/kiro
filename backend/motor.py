@@ -13,7 +13,6 @@ Regras de negocio principais:
 """
 from __future__ import annotations
 
-import re
 import unicodedata
 import warnings
 from dataclasses import dataclass
@@ -61,14 +60,18 @@ GRUPO_PESO = {
     "crianca_pequena": "familia",
     "crianca_escolar": "familia",
 }
-PESOS_BASE = dict(perfil=0.20, segmento=0.20, bairro=0.08, saz=0.10,
-                  proximo=0.17, conteudo=0.10, pop=0.10, qualidade=0.05)
+# O perfil nao entra na soma: ele multiplica o score comportamental (1 + beta * perfil).
+PESOS_BASE = dict(perfil=0.0, segmento=0.45, bairro=0.05, saz=0.0,
+                  proximo=0.35, conteudo=0.0, pop=0.10, qualidade=0.05)
 AJUSTE_GRUPO = {
-    "idoso": dict(perfil=0.26, bairro=0.10, pop=0.12, saz=0.07),
-    "empreendedor": dict(perfil=0.26, saz=0.13),
-    "pcd": dict(perfil=0.32, segmento=0.16, pop=0.07),
-    "familia": dict(perfil=0.22, segmento=0.22, saz=0.12),
+    "idoso": dict(bairro=0.08),
+    "empreendedor": dict(saz=0.05),
+    "pcd": dict(),
+    "familia": dict(saz=0.04),
 }
+BETA_BASE = 0.30
+BETA_GRUPO = {"idoso": 0.40, "empreendedor": 0.40, "pcd": 0.60, "familia": 0.35}
+SOMA = [k for k in SINAIS if k != "perfil"]
 
 TEXTO_PERFIL = {
     "idoso": "Serviço pensado para pessoas idosas.",
@@ -356,6 +359,8 @@ class Motor:
     def _saz(self, ref: date) -> Dict[str, np.ndarray]:
         if ref in self._saz_cache:
             return self._saz_cache[ref]
+        if len(self._saz_cache) >= 64:  # a API aceita datas arbitrarias: limita a memoria
+            self._saz_cache.clear()
         kmax = min(self._col(self.corte - timedelta(days=7)), self.nw - 1)
         ref_w = ref - timedelta(days=ref.weekday())
         c = self._col(ref_w - timedelta(days=364))
@@ -470,7 +475,11 @@ class Motor:
             "proximo": tem_hist, "conteudo": bool(tem_hist or cents),
         }
         pesos = self._pesos(grupos, ativos)
-        final = sum(pesos[k] * sin[k] for k in SINAIS)
+        beta = float(np.mean([BETA_GRUPO[g] for g in grupos])) if grupos else BETA_BASE
+        if not prefs.usar_perfil:
+            beta = 0.0
+        base = sum(pesos[k] * sin[k] for k in SOMA)
+        final = base * (1.0 + beta * sin["perfil"])
         # servicos de publico especifico sem aderencia ao cidadao perdem forca
         ajuste = np.where(self.restrito & ~match, 0.45, 1.0) * self.fator_digital
         final = final * ajuste
@@ -480,8 +489,9 @@ class Motor:
         tot = sum(pesos_d.values())
         if tot > 0:
             pesos_d = {k: v / tot for k, v in pesos_d.items()}
-        disc = sum(pesos_d[k] * sin[k] for k in SINAIS) * ajuste
-        return dict(c=c, tags=tags, segs=segs, sin=sin, pesos=pesos, final=final, disc=disc,
+        base_d = sum(pesos_d[k] * sin[k] for k in SOMA)
+        disc = (base_d + 0.25 * sin["conteudo"]) * (1.0 + 2.0 * beta * sin["perfil"]) * ajuste
+        return dict(beta=beta, base=base, c=c, tags=tags, segs=segs, sin=sin, pesos=pesos, final=final, disc=disc,
                     ajuste=ajuste, wvec=wvec, tem_hist=tem_hist, conhecidos=conhecidos,
                     match=match, saz=saz, usar_historico=prefs.usar_historico)
 
@@ -513,11 +523,14 @@ class Motor:
                     nome = [k for k, v in self.tema_idx.items() if v == melhor][0]
                     return f"Parecido com serviços de {nome} que você já usou."
             if self.tema1[s]:
-                return f"Combina com o seu perfil: serviço de {self.tema1[s]}."
+                if x["tags"]:
+                    return f"Serviço de {self.tema1[s]} que combina com o seu perfil."
+                return f"Serviço de {self.tema1[s]} que pode ajudar você."
         return "Um dos serviços mais usados no app."
 
     def _principal(self, s: int, x: Dict) -> str:
         contrib = {k: x["pesos"][k] * x["sin"][k][s] for k in SINAIS_COM_MOTIVO}
+        contrib["perfil"] = x["beta"] * x["sin"]["perfil"][s] * x["base"][s]
         # popularidade so explica quando nada mais pesa
         melhor = max(contrib, key=lambda k: contrib[k] if k != "pop" else contrib[k] * 0.5)
         return melhor if contrib[melhor] > 0.005 else "pop"
@@ -542,7 +555,7 @@ class Motor:
         return escolhidos
 
     def recomendar(self, cidadao_id: str, limite: int = 10, prefs: Optional[Preferencias] = None,
-                   vagas_descoberta: int = 3, data_ref: Optional[date] = None,
+                   vagas_descoberta: int = 1, data_ref: Optional[date] = None,
                    detalhe: bool = False) -> List[Dict]:
         prefs = prefs or Preferencias()
         ref = data_ref or self.ref
@@ -603,9 +616,12 @@ class Motor:
         return itens
 
     def _principal_desc(self, s: int, x: Dict) -> str:
-        contrib = {k: x["pesos"][k] * x["sin"][k][s] for k in ("perfil", "conteudo", "segmento", "saz", "bairro")}
+        contrib = {"perfil": x["sin"]["perfil"][s], "conteudo": x["sin"]["conteudo"][s],
+                   "segmento": x["sin"]["segmento"][s], "bairro": 0.5 * x["sin"]["bairro"][s]}
+        if x["sin"]["perfil"][s] > 0:
+            return "perfil"
         melhor = max(contrib, key=contrib.get)
-        return melhor if contrib[melhor] > 0.005 else "conteudo"
+        return melhor if contrib[melhor] > 0.05 else "conteudo"
 
     # -------------------------------------------------------------- auxiliares
     def perfis_ativos(self, cidadao_id: str, prefs: Preferencias) -> List[str]:
