@@ -127,3 +127,113 @@ def gravar_prefs(cid: str, dados: Dict) -> None:
 def apagar_prefs(cid: str) -> None:
     with conexao() as con:
         con.execute("DELETE FROM preferencias WHERE cidadao_id = ?", (cid,))
+
+
+# ---------------------------------------------------------------- pedidos
+def _pedido(r: sqlite3.Row) -> Dict:
+    d = dict(r)
+    d["dados"] = json.loads(d["dados"])
+    d["simulado"] = bool(d["simulado"])
+    return d
+
+
+def criar_pedido(cid: str, servico_id: int, dados: Dict) -> Dict:
+    with conexao() as con:
+        cur = con.execute("INSERT INTO pedidos (cidadao_id, servico_id, dados) VALUES (?, ?, ?)",
+                          (cid, servico_id, json.dumps(dados, ensure_ascii=False)))
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _pedido(r)
+
+
+def ler_pedido(pid: int) -> Optional[Dict]:
+    with conexao() as con:
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (pid,)).fetchone()
+    return _pedido(r) if r else None
+
+
+def listar_pedidos(cid: str) -> list:
+    with conexao() as con:
+        rs = con.execute("SELECT * FROM pedidos WHERE cidadao_id = ? ORDER BY id DESC", (cid,)).fetchall()
+    return [_pedido(r) for r in rs]
+
+
+def atualizar_rascunho(pid: int, dados: Optional[Dict], ultimo_passo: Optional[int]) -> Optional[Dict]:
+    """Mescla dados no rascunho. Retorna None se nao existe; levanta ValueError se ja enviado."""
+    with conexao() as con:
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (pid,)).fetchone()
+        if r is None:
+            return None
+        if r["status"] != "rascunho":
+            raise ValueError("pedido ja enviado")
+        novos = json.loads(r["dados"])
+        novos.update(dados or {})
+        passo = r["ultimo_passo"] if ultimo_passo is None else ultimo_passo
+        con.execute("UPDATE pedidos SET dados = ?, ultimo_passo = ? WHERE id = ?",
+                    (json.dumps(novos, ensure_ascii=False), passo, pid))
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (pid,)).fetchone()
+    return _pedido(r)
+
+
+# Linha do tempo simulada: (etapa, status, horas desde o envio).
+LINHA_DO_TEMPO = [("recebido", "concluida", 0), ("em_analise", "concluida", 24),
+                  ("decisao", "pendente", 72)]
+
+
+def enviar_pedido(pid: int) -> Optional[Dict]:
+    """Gera o protocolo, muda para 'enviado' e cria os eventos simulados."""
+    with conexao() as con:
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (pid,)).fetchone()
+        if r is None:
+            return None
+        if r["status"] != "rascunho":
+            raise ValueError("pedido ja enviado")
+        protocolo = f"KDK-{r['criado_em'][:4]}-{pid:06d}"
+        con.execute("UPDATE pedidos SET status = 'enviado', protocolo = ?, enviado_em = datetime('now') "
+                    "WHERE id = ?", (protocolo, pid))
+        for etapa, status, horas in LINHA_DO_TEMPO:
+            con.execute("INSERT INTO pedido_eventos (pedido_id, etapa, status, horas_simuladas) "
+                        "VALUES (?, ?, ?, ?)", (pid, etapa, status, horas))
+        r = con.execute("SELECT * FROM pedidos WHERE id = ?", (pid,)).fetchone()
+    return _pedido(r)
+
+
+def eventos_pedido(pid: int) -> list:
+    with conexao() as con:
+        rs = con.execute("SELECT etapa, status, horas_simuladas, criado_em FROM pedido_eventos "
+                         "WHERE pedido_id = ? ORDER BY id", (pid,)).fetchall()
+    return [dict(r) for r in rs]
+
+
+# -------------------------------------------------- eventos de UX e pesquisas
+def gravar_evento_ux(pseudo: str, e: Dict) -> int:
+    with conexao() as con:
+        cur = con.execute(
+            "INSERT INTO eventos_ux (usuario_pseudo, tipo, servico_id, passo, posicao, origem, duracao_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pseudo, e["tipo"], e.get("servico_id"), e.get("passo"), e.get("posicao"),
+             e.get("origem"), e.get("duracao_ms")))
+        return cur.lastrowid
+
+
+def resumo_eventos_ux() -> Dict:
+    with conexao() as con:
+        rs = con.execute("SELECT tipo, COUNT(*) AS n FROM eventos_ux GROUP BY tipo").fetchall()
+    return {r["tipo"]: r["n"] for r in rs}
+
+
+def gravar_pesquisa(pseudo: str, servico_id: Optional[int], nota: int, comentario: Optional[str]) -> int:
+    with conexao() as con:
+        cur = con.execute("INSERT INTO pesquisas (usuario_pseudo, servico_id, nota, comentario) "
+                          "VALUES (?, ?, ?, ?)", (pseudo, servico_id, nota, comentario))
+        return cur.lastrowid
+
+
+def resumo_pesquisas(servico_id: int) -> Dict:
+    with conexao() as con:
+        r = con.execute("SELECT COUNT(*) AS n, AVG(nota) AS media FROM pesquisas WHERE servico_id = ?",
+                        (servico_id,)).fetchone()
+        dist = con.execute("SELECT nota, COUNT(*) AS n FROM pesquisas WHERE servico_id = ? GROUP BY nota",
+                           (servico_id,)).fetchall()
+    return {"servico_id": servico_id, "total": r["n"],
+            "media": round(r["media"], 2) if r["media"] is not None else None,
+            "distribuicao": {str(k["nota"]): k["n"] for k in dist}}
