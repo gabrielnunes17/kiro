@@ -404,12 +404,19 @@ class Motor:
         return {k: v / tot for k, v in pesos.items()} if tot > 0 else dict(PESOS_BASE)
 
     # ----------------------------------------------------------------- score
-    def _calcular(self, cidadao_id: str, prefs: Preferencias, ref: date) -> Dict:
+    def _calcular(self, cidadao_id: str, prefs: Preferencias, ref: date,
+                  tags_forcadas: Optional[List[str]] = None, rpa: Optional[int] = None) -> Dict:
+        """tags_forcadas/rpa: modo demonstracao. Substituem as tags e a RPA derivadas do cadastro.
+        Tags de saude nunca sao forcadas, e usar_perfil=False continua valendo."""
         c = self.cid.get(cidadao_id)
         tags_todas = self.tags_all.get(cidadao_id, [])
-        tags = [t for t in tags_todas if (prefs.consentimento_saude or t not in TAGS_SAUDE)]
+        if tags_forcadas:
+            tags = [t for t in tags_forcadas if t not in TAGS_SAUDE]
+        else:
+            tags = [t for t in tags_todas if (prefs.consentimento_saude or t not in TAGS_SAUDE)]
         if not prefs.usar_perfil:
             tags = []
+        rpa_ef = rpa if rpa is not None else (int(c["rpa"]) if c else None)
         h = self.hist.get(cidadao_id) if prefs.usar_historico else None
         wvec = np.zeros(self.n)
         if h is not None:
@@ -428,8 +435,9 @@ class Motor:
         sin["perfil"] = match.astype(float)
         # segmento comportamental (o que perfis parecidos usam)
         segs: Dict[str, np.ndarray] = {}
-        if prefs.usar_perfil and c:
-            segs["faixa"] = 0.5 * self.seg_faixa[c["faixa_etaria"]]
+        if prefs.usar_perfil:
+            if c and not tags_forcadas:  # perfil simulado nao herda a faixa etaria real
+                segs["faixa"] = 0.5 * self.seg_faixa[c["faixa_etaria"]]
             for t in tags:
                 if t in self.seg_tag:
                     segs[t] = self.seg_tag[t]
@@ -438,8 +446,8 @@ class Motor:
             sin["segmento"] = sum(segs.values()) / tot_w
         else:
             sin["segmento"] = np.zeros(self.n)
-        usar_bairro = prefs.usar_bairro and bool(c)
-        sin["bairro"] = self.seg_rpa[int(c["rpa"])] if usar_bairro else np.zeros(self.n)
+        usar_bairro = prefs.usar_bairro and rpa_ef in self.seg_rpa
+        sin["bairro"] = self.seg_rpa[rpa_ef] if usar_bairro else np.zeros(self.n)
         saz = self._saz(ref) if prefs.usar_sazonalidade else None
         sin["saz"] = saz["score"] if saz else np.zeros(self.n)
         # proximo passo
@@ -491,7 +499,7 @@ class Motor:
             pesos_d = {k: v / tot for k, v in pesos_d.items()}
         base_d = sum(pesos_d[k] * sin[k] for k in SOMA)
         disc = (base_d + 0.25 * sin["conteudo"]) * (1.0 + 2.0 * beta * sin["perfil"]) * ajuste
-        return dict(beta=beta, base=base, c=c, tags=tags, segs=segs, sin=sin, pesos=pesos, final=final, disc=disc,
+        return dict(beta=beta, base=base, c=c, rpa=rpa_ef, usar_bairro=usar_bairro, tags=tags, segs=segs, sin=sin, pesos=pesos, final=final, disc=disc,
                     ajuste=ajuste, wvec=wvec, tem_hist=tem_hist, conhecidos=conhecidos,
                     match=match, saz=saz, usar_historico=prefs.usar_historico)
 
@@ -505,15 +513,15 @@ class Motor:
             melhor = max(x["segs"], key=lambda k: x["segs"][k][s])
             return TEXTO_SEGMENTO.get(melhor, TEXTO_SEGMENTO_PADRAO)
         if principal == "bairro":
-            return f"Muito procurado por quem mora na sua região (RPA {int(x['c']['rpa'])})."
+            return f"Muito procurado por quem mora na sua região (RPA {x['rpa']})."
         if principal == "saz":
             if x["saz"]["season"][s] >= 1.3:
                 return "Costuma ser mais procurado nesta época do ano."
             return "A procura por este serviço está crescendo nas últimas semanas."
         if principal == "proximo":
-            contrib = x["wvec"] * self.P[:, s]
-            a = int(np.argmax(contrib))
-            return f"Quem usou «{self.nome[a]}» costuma usar também este serviço."
+            # Texto generico de proposito: nao cita o servico anterior, que pode ser
+            # sensivel (ex.: saude) e ficar visivel na tela do celular.
+            return "Pessoas com um uso parecido com o seu costumam usar este serviço."
         if principal == "conteudo":
             ut = x["wvec"] @ self.tema_mat
             temas = [self.tema_idx[t] for t in self.temas[s]]
@@ -554,24 +562,52 @@ class Motor:
                 escolhidos.append(s)
         return escolhidos
 
+    def _item(self, pos: int, s: int, tipo: str, principal: str, x: Dict, detalhe: bool = False) -> Dict:
+        motivo = self._motivo(s, x, principal)
+        if tipo == "descoberta":
+            motivo = "Descoberta: " + motivo[0].lower() + motivo[1:]
+        r = self.sv.iloc[s]
+        item = {
+            "posicao": pos,
+            "servico_id": int(self.ids[s]),
+            "nome": self.nome[s],
+            "orgao": r["orgao_sigla"],
+            "tema": self.tema1[s],
+            "natureza": r["natureza"],
+            "gratuito": str(r["gratuito"]).lower() == "true",
+            "nivel_digital": None if np.isnan(self.nivel[s]) else int(self.nivel[s]),
+            "canal_app": r["canal_app"] or None,
+            "motivo": motivo,
+            "sinal_principal": principal,
+            "tipo": tipo,
+            "novo": True if x["usar_historico"] else None,
+        }
+        if detalhe:
+            item["sinais"] = {k: round(float(x["sin"][k][s]), 3) for k in SINAIS}
+            item["pesos"] = {k: round(float(v), 3) for k, v in x["pesos"].items()}
+            item["score"] = round(float(x["final"][s]), 4)
+        return item
+
+    @staticmethod
+    def _ranquear(score: np.ndarray) -> np.ndarray:
+        ordem = np.argsort(-score, kind="stable")
+        return ordem[score[ordem] > 0]
+
     def recomendar(self, cidadao_id: str, limite: int = 10, prefs: Optional[Preferencias] = None,
                    vagas_descoberta: int = 1, data_ref: Optional[date] = None,
-                   detalhe: bool = False) -> List[Dict]:
+                   detalhe: bool = False, tags_forcadas: Optional[List[str]] = None,
+                   rpa: Optional[int] = None) -> List[Dict]:
         prefs = prefs or Preferencias()
         ref = data_ref or self.ref
-        x = self._calcular(cidadao_id, prefs, ref)
+        x = self._calcular(cidadao_id, prefs, ref, tags_forcadas, rpa)
         elegivel = ~x["conhecidos"]
-        score = np.where(elegivel, x["final"], -1.0)
-        ordem = np.argsort(-score, kind="stable")
-        ordem = ordem[score[ordem] > 0]
+        ordem = self._ranquear(np.where(elegivel, x["final"], -1.0))
 
         n_desc = min(vagas_descoberta, limite // 3)
         estado = {"set": set(), "pref": {}, "tema": {}}
         principais = self._escolher(ordem, limite - n_desc, estado, set())
         score_d = np.where(elegivel & self.cauda & (x["ajuste"] >= 1.0) & (x["disc"] > 0), x["disc"], -1.0)
-        ordem_d = np.argsort(-score_d, kind="stable")
-        ordem_d = ordem_d[score_d[ordem_d] > 0]
-        descobertas = self._escolher(ordem_d, n_desc, estado, set())
+        descobertas = self._escolher(self._ranquear(score_d), n_desc, estado, set())
         extras = self._escolher(ordem, limite - len(principais) - len(descobertas), estado, set())
         principais += extras
 
@@ -589,31 +625,65 @@ class Motor:
         itens = []
         for pos, (s, tipo) in enumerate(final, start=1):
             principal = self._principal(s, x) if tipo == "para_voce" else self._principal_desc(s, x)
-            motivo = self._motivo(s, x, principal)
-            if tipo == "descoberta":
-                motivo = "Descoberta: " + motivo[0].lower() + motivo[1:]
-            r = self.sv.iloc[s]
-            item = {
-                "posicao": pos,
-                "servico_id": int(self.ids[s]),
-                "nome": self.nome[s],
-                "orgao": r["orgao_sigla"],
-                "tema": self.tema1[s],
-                "natureza": r["natureza"],
-                "gratuito": str(r["gratuito"]).lower() == "true",
-                "nivel_digital": None if np.isnan(self.nivel[s]) else int(self.nivel[s]),
-                "canal_app": r["canal_app"] or None,
-                "motivo": motivo,
-                "sinal_principal": principal,
-                "tipo": tipo,
-                "novo": True if x["usar_historico"] else None,
-            }
-            if detalhe:
-                item["sinais"] = {k: round(float(x["sin"][k][s]), 3) for k in SINAIS}
-                item["pesos"] = {k: round(float(v), 3) for k, v in x["pesos"].items()}
-                item["score"] = round(float(x["final"][s]), 4)
-            itens.append(item)
+            itens.append(self._item(pos, s, tipo, principal, x, detalhe))
         return itens
+
+    # Tamanho de cada secao da home (poucos itens bem escolhidos valem mais que uma lista longa).
+    VITRINE_TAMANHOS = {"para_voce_agora": 5, "na_sua_regiao": 3, "em_alta_nesta_epoca": 3, "descubra": 2}
+
+    def vitrine(self, cidadao_id: str, prefs: Optional[Preferencias] = None,
+                data_ref: Optional[date] = None, tags_forcadas: Optional[List[str]] = None,
+                rpa: Optional[int] = None) -> Dict:
+        """Secoes da home. Nenhum servico se repete entre secoes nem vem do historico do cidadao."""
+        prefs = prefs or Preferencias()
+        x = self._calcular(cidadao_id, prefs, data_ref or self.ref, tags_forcadas, rpa)
+        elegivel = ~x["conhecidos"]
+        estado = {"set": set(), "pref": {}, "tema": {}}
+        tam = self.VITRINE_TAMANHOS
+        avisos: Dict[str, str] = {}
+        secoes: Dict[str, List[Dict]] = {}
+
+        def montar(nome: str, idxs: List[int], tipo: str, principal=None) -> None:
+            secoes[nome] = [
+                self._item(i, s, tipo, principal or (self._principal_desc(s, x) if tipo == "descoberta"
+                                                      else self._principal(s, x)), x)
+                for i, s in enumerate(idxs, start=1)
+            ]
+
+        # 1) Para voce agora
+        ordem = self._ranquear(np.where(elegivel, x["final"], -1.0))
+        montar("para_voce_agora", self._escolher(ordem, tam["para_voce_agora"], estado, set()), "para_voce")
+
+        # 2) Descubra: cauda de popularidade que combina com o perfil. Sem sinal nenhum
+        #    (visitante sem perfil nem regiao), cai para os de melhor qualidade da cauda.
+        base_d = elegivel & self.cauda & (x["ajuste"] >= 1.0)
+        ordem_d = self._ranquear(np.where(base_d & (x["disc"] > 0), x["disc"], -1.0))
+        desc = self._escolher(ordem_d, tam["descubra"], estado, set())
+        if not desc:
+            ordem_q = self._ranquear(np.where(base_d, self.qualidade + 1e-6, -1.0))
+            desc = self._escolher(ordem_q, tam["descubra"], estado, set())
+        montar("descubra", desc, "descoberta")
+
+        # 3) Na sua regiao: servicos fortes na RPA (so com usar_bairro ligado e RPA conhecida)
+        if x["usar_bairro"]:
+            ordem_r = self._ranquear(np.where(elegivel, x["sin"]["bairro"] * x["ajuste"], -1.0))
+            montar("na_sua_regiao", self._escolher(ordem_r, tam["na_sua_regiao"], estado, set()),
+                   "regiao", "bairro")
+        else:
+            secoes["na_sua_regiao"] = []
+            avisos["na_sua_regiao"] = ("regiao_desligada" if not prefs.usar_bairro else "regiao_desconhecida")
+
+        # 4) Em alta nesta epoca (so com usar_sazonalidade ligado)
+        if x["saz"] is not None:
+            ordem_s = self._ranquear(np.where(elegivel, x["sin"]["saz"] * x["ajuste"], -1.0))
+            montar("em_alta_nesta_epoca", self._escolher(ordem_s, tam["em_alta_nesta_epoca"], estado, set()),
+                   "epoca", "saz")
+        else:
+            secoes["em_alta_nesta_epoca"] = []
+            avisos["em_alta_nesta_epoca"] = "sazonalidade_desligada"
+
+        ordem_chaves = ["para_voce_agora", "na_sua_regiao", "em_alta_nesta_epoca", "descubra"]
+        return {"secoes": {k: secoes[k] for k in ordem_chaves}, "avisos": avisos}
 
     def _principal_desc(self, s: int, x: Dict) -> str:
         contrib = {"perfil": x["sin"]["perfil"][s], "conteudo": x["sin"]["conteudo"][s],
@@ -624,7 +694,10 @@ class Motor:
         return melhor if contrib[melhor] > 0.05 else "conteudo"
 
     # -------------------------------------------------------------- auxiliares
-    def perfis_ativos(self, cidadao_id: str, prefs: Preferencias) -> List[str]:
+    def perfis_ativos(self, cidadao_id: str, prefs: Preferencias,
+                      tags_forcadas: Optional[List[str]] = None) -> List[str]:
+        if tags_forcadas:
+            return [t for t in tags_forcadas if t not in TAGS_SAUDE] if prefs.usar_perfil else []
         tags = self.tags_all.get(cidadao_id, [])
         return [t for t in tags if prefs.consentimento_saude or t not in TAGS_SAUDE]
 

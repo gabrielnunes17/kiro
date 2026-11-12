@@ -5,11 +5,9 @@ Executar (a partir da raiz do projeto):
 """
 from __future__ import annotations
 
-import json
-import threading
 from contextlib import asynccontextmanager
 from datetime import date
-from pathlib import Path
+from enum import Enum
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -18,34 +16,17 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
+from backend import db, erros
 from backend.motor import Motor, Preferencias
+from backend.personas import PERFIS_SIMULADOS
 
-ARQ_PREFS = Path("data/preferencias.json")
-_lock = threading.Lock()
-_estado: Dict = {"motor": None, "prefs": {}}
-
-
-def _carregar_prefs() -> Dict[str, dict]:
-    if ARQ_PREFS.exists():
-        try:
-            return json.loads(ARQ_PREFS.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}  # arquivo corrompido: volta ao padrao em vez de derrubar a API
-    return {}
-
-
-def _salvar_prefs() -> None:
-    # Escrita atomica: grava em temporario e troca, evitando arquivo pela metade.
-    ARQ_PREFS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ARQ_PREFS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_estado["prefs"], ensure_ascii=False), encoding="utf-8")
-    tmp.replace(ARQ_PREFS)
+_estado: Dict = {"motor": None}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    db.iniciar()
     _estado["motor"] = Motor()
-    _estado["prefs"] = _carregar_prefs()
     yield
 
 
@@ -53,6 +34,7 @@ app = FastAPI(title="Kodiak - Hiperpersonalizacao", version="0.1.0", lifespan=li
               docs_url=None, redoc_url=None)
 # Prototipo: libera o front local. Em producao, restringir aos dominios do Kodiak.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+erros.registrar(app)
 
 
 class PreferenciasIn(BaseModel):
@@ -63,12 +45,26 @@ class PreferenciasIn(BaseModel):
     usar_sazonalidade: bool = True
 
 
+class PerfilSimulado(str, Enum):
+    idoso = "idoso"
+    empreendedor = "empreendedor"
+    pcd = "pcd"
+    familia = "familia"
+
+
+def _tags(perfil: Optional[PerfilSimulado]) -> Optional[List[str]]:
+    return PERFIS_SIMULADOS[perfil.value] if perfil else None
+
+
 def _motor() -> Motor:
     return _estado["motor"]
 
 
 def _prefs(cid: str) -> Preferencias:
-    return Preferencias(**_estado["prefs"].get(cid, {}))
+    salvas = db.ler_prefs(cid) or {}
+    # Ignora chaves desconhecidas (ex.: campos de versoes futuras) em vez de quebrar.
+    validas = {k: v for k, v in salvas.items() if k in Preferencias.__dataclass_fields__}
+    return Preferencias(**validas)
 
 
 @app.get("/", include_in_schema=False)
@@ -118,10 +114,32 @@ def ler_preferencias(cid: str) -> Dict:
 def gravar_preferencias(cid: str, body: PreferenciasIn) -> Dict:
     if cid not in _motor().cid:
         raise HTTPException(status_code=404, detail="Cidadão não encontrado")
-    with _lock:
-        _estado["prefs"][cid] = body.model_dump()
-        _salvar_prefs()
-    return _estado["prefs"][cid]
+    dados = body.model_dump()
+    db.gravar_prefs(cid, dados)
+    return dados
+
+
+@app.get("/vitrine/{cid}")
+def vitrine(
+    cid: str,
+    perfil_simulado: Optional[PerfilSimulado] = None,
+    rpa: Optional[int] = Query(None, ge=1, le=6),
+    semana: Optional[date] = None,
+) -> Dict:
+    """Secoes da home. perfil_simulado e rpa so servem ao modo demonstracao."""
+    m = _motor()
+    prefs = _prefs(cid)
+    tags = _tags(perfil_simulado)
+    v = m.vitrine(cid, prefs=prefs, data_ref=semana, tags_forcadas=tags, rpa=rpa)
+    return {
+        "cidadao_id": cid,
+        "anonimo": cid not in m.cid,
+        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
+        "data_referencia": (semana or m.ref).isoformat(),
+        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
+        "preferencias": prefs.__dict__,
+        **v,
+    }
 
 
 @app.get("/cidadaos/{cid}/recomendacoes")
@@ -131,16 +149,20 @@ def recomendacoes(
     vagas_descoberta: int = Query(1, ge=0, le=3),
     semana: Optional[date] = None,
     detalhe: bool = False,
+    perfil_simulado: Optional[PerfilSimulado] = None,
+    rpa: Optional[int] = Query(None, ge=1, le=6),
 ) -> Dict:
     m = _motor()
     prefs = _prefs(cid)
+    tags = _tags(perfil_simulado)
     itens = m.recomendar(cid, limite=limite, prefs=prefs, vagas_descoberta=vagas_descoberta,
-                         data_ref=semana, detalhe=detalhe)
+                         data_ref=semana, detalhe=detalhe, tags_forcadas=tags, rpa=rpa)
     return {
         "cidadao_id": cid,
         "anonimo": cid not in m.cid,
+        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
         "data_referencia": (semana or m.ref).isoformat(),
-        "perfis_ativos": m.perfis_ativos(cid, prefs),
+        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
         "preferencias": prefs.__dict__,
         "itens": itens,
     }
