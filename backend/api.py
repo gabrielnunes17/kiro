@@ -55,7 +55,10 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Kodiak - Hiperpersonalizacao", version="0.2.0", description=DESCRICAO,
-              openapi_tags=TAGS, lifespan=lifespan, docs_url=None, redoc_url=None)
+              openapi_tags=TAGS, lifespan=lifespan, docs_url=None, redoc_url=None,
+              # URL relativa: o "Try it out" do Swagger resolve a partir do openapi.json, entao
+              # funciona direto (/) e atras de proxy com prefixo (ex.: /proxy/8000/).
+              servers=[{"url": "."}])
 # Prototipo: libera o front local. Em producao, restringir aos dominios do Kodiak.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 erros.registrar(app)
