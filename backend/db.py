@@ -5,6 +5,7 @@ O caminho vem de KODIAK_DB (padrao data/app.db); os testes apontam para um arqui
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS pesquisas (
     comentario TEXT,
     criado_em TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE INDEX IF NOT EXISTS ix_eventos_pseudo ON eventos_ux(usuario_pseudo);
+CREATE INDEX IF NOT EXISTS ix_pesquisas_pseudo ON pesquisas(usuario_pseudo);
 """
 
 
@@ -237,3 +240,20 @@ def resumo_pesquisas(servico_id: int) -> Dict:
     return {"servico_id": servico_id, "total": r["n"],
             "media": round(r["media"], 2) if r["media"] is not None else None,
             "distribuicao": {str(k["nota"]): k["n"] for k in dist}}
+
+
+def pseudonimo(cid: str) -> str:
+    """Pseudonimo estavel: eventos e pesquisas nunca guardam o id real."""
+    sal = os.environ.get("KODIAK_SALT", "kodiak-prototipo")
+    return hashlib.sha256(f"{sal}:{cid}".encode()).hexdigest()[:16]
+
+
+def feedback_bruto(pseudo: str) -> tuple:
+    """Retorna (eventos, notas): eventos = [(servico_id, tipo, n)], notas = [(servico_id, nota)]."""
+    with conexao() as con:
+        ev = con.execute("SELECT servico_id, tipo, COUNT(*) AS n FROM eventos_ux "
+                         "WHERE usuario_pseudo = ? AND servico_id IS NOT NULL GROUP BY 1, 2",
+                         (pseudo,)).fetchall()
+        nt = con.execute("SELECT servico_id, nota FROM pesquisas "
+                         "WHERE usuario_pseudo = ? AND servico_id IS NOT NULL", (pseudo,)).fetchall()
+    return [(r["servico_id"], r["tipo"], r["n"]) for r in ev], [(r["servico_id"], r["nota"]) for r in nt]

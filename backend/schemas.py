@@ -26,6 +26,14 @@ class PerfilSimulado(str, Enum):
     empreendedor = "empreendedor"
     pcd = "pcd"
     familia = "familia"
+    jovem_estudante = "jovem_estudante"
+
+
+class Momento(str, Enum):
+    novo = "novo"
+    explorador = "explorador"
+    recorrente = "recorrente"
+    retomada = "retomada"
 
 
 # ------------------------------------------------------------- preferencias
@@ -90,11 +98,15 @@ class Item(BaseModel):
     canal_app: Optional[str] = None
     motivo: str = Field(description="Frase em linguagem simples explicando a sugestão.")
     sinal_principal: str
-    tipo: str = Field(description="para_voce, descoberta, regiao ou epoca.")
+    tipo: str = Field(description="para_voce, descoberta, regiao, epoca, afinidade ou pedido.")
     novo: Optional[bool] = Field(None, description="True se o cidadão ainda não usou (null sem histórico).")
     sinais: Optional[Dict[str, float]] = Field(None, description="Só com detalhe=true.")
     pesos: Optional[Dict[str, float]] = Field(None, description="Só com detalhe=true.")
     score: Optional[float] = Field(None, description="Só com detalhe=true.")
+    pedido_id: Optional[int] = Field(None, description="Só em itens de pedido (tipo=pedido).")
+    ultimo_passo: Optional[int] = Field(None, description="Só em itens de pedido.")
+    protocolo: Optional[str] = Field(None, description="Só em itens de pedido enviado.")
+    status_pedido: Optional[str] = Field(None, description="rascunho ou enviado. Só em itens de pedido.")
 
 
 EXEMPLO_ITEM = {
@@ -106,7 +118,7 @@ EXEMPLO_ITEM = {
 
 
 class Contexto(BaseModel):
-    cidadao_id: str
+    cidadao_id: Optional[str] = Field(None, description="Null nas rotas anônimas (sem id).")
     anonimo: bool
     perfil_simulado: Optional[PerfilSimulado] = None
     data_referencia: str = Field(description="Data usada na sazonalidade (AAAA-MM-DD).")
@@ -123,6 +135,51 @@ class RecomendacoesOut(Contexto):
         "preferencias": Preferencias().model_dump(), "itens": [EXEMPLO_ITEM]}})
 
 
+class Inferido(BaseModel):
+    tipo: str
+    confianca: float = Field(description="0 a 1. Quanto o histórico sustenta o tipo.")
+
+
+class PerfilTipo(BaseModel):
+    tipo: str = Field(description="Tipo principal: pcd, idoso, familia, empreendedor, jovem_estudante ou geral.")
+    rotulo: str = Field(description="Nome para uso interno do front. Não exibir como etiqueta ao cidadão.")
+    tipo_base: str = Field(description="Tipo pelo cadastro. Pode diferir de `tipo` se o comportamento o superar.")
+    secundarios: List[str] = Field(description="Outros tipos do cadastro.")
+    inferidos: List[Inferido] = Field(description="Tipos sugeridos pelo histórico de uso.")
+    momento: str = Field(description="novo, explorador, recorrente ou retomada.")
+    maturidade_digital: Optional[str] = Field(None, description="baixa, media ou alta. Null sem histórico.")
+    temas_foco: List[str] = Field(description="Até 3 temas mais usados. Sem saúde, salvo consentimento.")
+    confianca: float = Field(description="0 a 1. Quanto dado sustenta o perfil.")
+    origem: str = Field(description="cadastro, comportamento, simulado ou padrao.")
+
+
+EXEMPLO_PERFIL_TIPO = {
+    "tipo": "empreendedor", "rotulo": "Empreendedor", "tipo_base": "empreendedor",
+    "secundarios": [], "inferidos": [{"tipo": "familia", "confianca": 0.55}], "momento": "recorrente",
+    "maturidade_digital": "alta", "temas_foco": ["PJ e Autônomo", "Licenças, Alvarás e Permissões"],
+    "confianca": 1.0, "origem": "cadastro"}
+
+
+class TipoPerfilOut(PerfilTipo):
+    cidadao_id: str
+
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "cidadao_id": "C068579", **EXEMPLO_PERFIL_TIPO}})
+
+
+class Ui(BaseModel):
+    densidade: str = Field(description="normal ou baixa (menos itens e menos ruído visual).")
+    texto_simples: bool = Field(description="True: usar linguagem e telas mais simples.")
+
+
+class SecaoLayout(BaseModel):
+    id: str
+    titulo: str
+    subtitulo: str
+    tipo_secao: str = Field(description="recomendacao ou pedido.")
+    itens: List[Item]
+
+
 class Secoes(BaseModel):
     para_voce_agora: List[Item]
     na_sua_regiao: List[Item]
@@ -131,7 +188,11 @@ class Secoes(BaseModel):
 
 
 class VitrineOut(Contexto):
-    secoes: Secoes
+    perfil: PerfilTipo = Field(description="Perfil que moldou a vitrine.")
+    ui: Ui
+    layout: List[SecaoLayout] = Field(
+        description="Seções na ordem em que devem aparecer, já sem as vazias. Prefira este campo.")
+    secoes: Secoes = Field(description="Seções base por nome (formato anterior, mantido por compatibilidade).")
     avisos: Dict[str, str] = Field(
         description="Seções vazias e o motivo: regiao_desligada, regiao_desconhecida, sazonalidade_desligada.")
 
@@ -139,6 +200,10 @@ class VitrineOut(Contexto):
         "cidadao_id": "C068579", "anonimo": False, "perfil_simulado": None,
         "data_referencia": "2026-09-28", "perfis_ativos": ["empreendedor", "mulher"],
         "preferencias": Preferencias().model_dump(),
+        "perfil": EXEMPLO_PERFIL_TIPO, "ui": {"densidade": "normal", "texto_simples": False},
+        "layout": [{"id": "para_voce_agora", "titulo": "Seu próximo passo",
+                    "subtitulo": "Com base no que você já usou", "tipo_secao": "recomendacao",
+                    "itens": [EXEMPLO_ITEM]}],
         "secoes": {"para_voce_agora": [EXEMPLO_ITEM], "na_sua_regiao": [], "em_alta_nesta_epoca": [],
                    "descubra": []},
         "avisos": {"na_sua_regiao": "regiao_desligada"}}})

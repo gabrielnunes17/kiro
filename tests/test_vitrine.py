@@ -14,7 +14,8 @@ def todos_ids(v):
 
 
 def vitrine(client, cid=ANON, **params):
-    r = client.get(f"/vitrine/{cid}", params=params)
+    # ANON usa a rota sem id; id desconhecido em /vitrine/{cid} devolve 404 (ver test_anonimo.py)
+    r = client.get("/vitrine" if cid == ANON else f"/vitrine/{cid}", params=params)
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -99,7 +100,7 @@ def test_parametros_invalidos_422(client):
 
 
 def test_recomendacoes_com_perfil_simulado_e_rpa(client):
-    r = client.get(f"/cidadaos/{ANON}/recomendacoes", params={"perfil_simulado": "empreendedor", "rpa": 6})
+    r = client.get("/recomendacoes", params={"perfil_simulado": "empreendedor", "rpa": 6})
     assert r.status_code == 200
     j = r.json()
     assert j["perfil_simulado"] == "empreendedor" and j["perfis_ativos"] == ["empreendedor"]

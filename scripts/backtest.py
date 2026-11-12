@@ -13,11 +13,12 @@ import numpy as np  # noqa: E402
 from backend.motor import DATA_FIM, Motor, Preferencias  # noqa: E402
 
 
-def avaliar(motor, alvos, k, vagas, pop_ordem):
+def avaliar(motor, alvos, k, vagas, pop_ordem, analisador=None):
     hits, rec, mrr, desc_hits = [], [], [], []
     base_hits, base_rec = [], []
     for cid, novos in alvos.items():
-        itens = motor.recomendar(cid, limite=k, vagas_descoberta=vagas)
+        extra = analisador.definir(cid, Preferencias()).tags_inferidas if analisador else None
+        itens = motor.recomendar(cid, limite=k, vagas_descoberta=vagas, tags_extra=extra)
         ids = [i["servico_id"] for i in itens]
         achados = [p for p, s in enumerate(ids, 1) if s in novos]
         hits.append(1.0 if achados else 0.0)
@@ -40,6 +41,8 @@ def main() -> int:
     ap.add_argument("--amostra", type=int, default=3000)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--vagas", type=int, nargs="+", default=[0, 3])
+    ap.add_argument("--com-perfil", action="store_true",
+                    help="inclui as tags inferidas do comportamento (backend.perfil)")
     args = ap.parse_args()
 
     corte = date.fromisoformat(args.corte)
@@ -65,9 +68,13 @@ def main() -> int:
     amostra = random.sample(sorted(alvos), min(args.amostra, len(alvos)))
     alvos = {c: alvos[c] for c in amostra}
     pop_ordem = [int(motor.ids[i]) for i in np.argsort(-motor.pessoas)]
+    analisador = None
+    if args.com_perfil:
+        from backend.perfil import Analisador
+        analisador = Analisador(motor)
     for v in args.vagas:
         t = time.time()
-        r = avaliar(motor, alvos, args.k, v, pop_ordem)
+        r = avaliar(motor, alvos, args.k, v, pop_ordem, analisador)
         print(f"vagas_descoberta={v} ({time.time() - t:.0f}s): " +
               ", ".join(f"{k}={x:.4f}" for k, x in r.items()))
     return 0

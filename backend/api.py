@@ -6,8 +6,6 @@ Swagger UI na rota /docs.
 """
 from __future__ import annotations
 
-import hashlib
-import os
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Dict, List, Optional
@@ -18,11 +16,16 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from backend import db, erros
+from backend import perfil as pf
+from backend import perfis_vitrine as pv
 from backend import schemas as sc
 from backend.motor import Motor, Preferencias
 from backend.personas import PERFIS_SIMULADOS, PERSONAS
 
-_estado: Dict = {"motor": None}
+_estado: Dict = {"motor": None, "analisador": None}
+
+# Id interno do visitante. Vazio nunca coincide com um cidadao: as rotas com id exigem cadastro.
+ID_ANONIMO = ""
 
 DESCRICAO = """
 API de **hiperpersonalização** da Carta de Serviços do Recife para o app Kodiak.
@@ -51,6 +54,7 @@ TAGS = [
 async def lifespan(_: FastAPI):
     db.iniciar()
     _estado["motor"] = Motor()
+    _estado["analisador"] = pf.Analisador(_estado["motor"])
     yield
 
 
@@ -80,9 +84,20 @@ def _prefs(cid: str) -> Preferencias:
 
 
 def _pseudo(cid: str) -> str:
-    """Pseudonimo estavel: eventos e pesquisas nunca guardam o id real."""
-    sal = os.environ.get("KODIAK_SALT", "kodiak-prototipo")
-    return hashlib.sha256(f"{sal}:{cid}".encode()).hexdigest()[:16]
+    return db.pseudonimo(cid)
+
+
+def _contexto(cid: str, prefs: Preferencias) -> pf.Contexto:
+    """Pedidos e feedback do proprio cidadao. Feedback respeita usar_historico."""
+    fb = {}
+    if prefs.usar_historico:
+        fb = pf.fator_feedback(*db.feedback_bruto(_pseudo(cid)))
+    return pf.Contexto(pedidos=db.listar_pedidos(cid), feedback=fb)
+
+
+def _perfil(cid: str, prefs: Preferencias, ctx: pf.Contexto, tags: Optional[List[str]],
+            momento: Optional[sc.Momento] = None) -> pf.Perfil:
+    return _estado["analisador"].definir(cid, prefs, ctx, tags, momento.value if momento else None)
 
 
 def _exigir_servico(sid: int) -> None:
@@ -132,15 +147,14 @@ def personas() -> List[Dict]:
 
 
 @app.get("/cidadaos/{cid}/perfil", tags=["Cidadão"], summary="Perfil do cidadão",
-         response_model=sc.PerfilOut, response_model_exclude_unset=True)
+         response_model=sc.PerfilOut, response_model_exclude_unset=True, responses=sc.RESP_404)
 def perfil(cid: str) -> Dict:
-    """Dados básicos e perfis ativos. Id desconhecido devolve `anonimo: true` (visitante).
+    """Dados básicos e perfis ativos. Id fora do cadastro devolve 404.
     Marcadores de saúde não aparecem aqui; só são usados na personalização com consentimento."""
+    _exigir_cidadao(cid)
     m = _motor()
-    c = m.cid.get(cid)
+    c = m.cid[cid]
     prefs = _prefs(cid)
-    if c is None:
-        return {"cidadao_id": cid, "anonimo": True, "perfis_ativos": [], "preferencias": prefs.__dict__}
     publico = {k: c[k] for k in ("idade", "faixa_etaria", "sexo", "rpa", "aceita_notificacao")}
     return {
         "cidadao_id": cid,
@@ -154,10 +168,32 @@ def perfil(cid: str) -> Dict:
     }
 
 
+@app.get("/cidadaos/{cid}/tipo-perfil", tags=["Cidadão"], summary="Tipo de perfil do cidadão",
+         response_model=sc.TipoPerfilOut, responses=sc.RESP_404)
+def tipo_perfil(
+    cid: str,
+    perfil_simulado: Optional[sc.PerfilSimulado] = Query(None, description="Modo demonstração: força o perfil."),
+    momento: Optional[sc.Momento] = Query(None, description="Modo demonstração: força o momento."),
+) -> Dict:
+    """Perfil que o motor define para o cidadão, combinando cadastro e comportamento.
+
+    * `tipo_base` vem do cadastro; `tipo` é o principal e pode ser um tipo **inferido** do histórico
+      quando a evidência supera o cadastro (`origem: comportamento`).
+    * Serviços de saúde só entram na análise com `consentimento_saude`.
+    * `usar_perfil=false` resulta em `geral`; `usar_historico=false` desliga inferência e temas.
+    * Id fora do cadastro devolve 404. Para visitantes, use `GET /vitrine`."""
+    _exigir_cidadao(cid)
+    prefs = _prefs(cid)
+    p = _perfil(cid, prefs, _contexto(cid, prefs), _tags(perfil_simulado), momento)
+    return {"cidadao_id": cid, **p.publico()}
+
+
 @app.get("/cidadaos/{cid}/preferencias", tags=["Cidadão"], summary="Ler preferências",
-         response_model=sc.Preferencias)
+         response_model=sc.Preferencias, responses=sc.RESP_404)
 def ler_preferencias(cid: str) -> Dict:
-    """Sem preferências salvas, devolve o padrão (tudo ligado, exceto consentimento de saúde)."""
+    """Sem preferências salvas, devolve o padrão (tudo ligado, exceto consentimento de saúde).
+    Id fora do cadastro devolve 404."""
+    _exigir_cidadao(cid)
     return _prefs(cid).__dict__
 
 
@@ -172,34 +208,114 @@ def gravar_preferencias(cid: str, body: sc.Preferencias) -> Dict:
 
 
 # ----------------------------------------------------------- personalizacao
-@app.get("/vitrine/{cid}", tags=["Personalização"], summary="Vitrine da home",
+def _vitrine(cid: str, anonimo: bool, prefs: Preferencias, perfil_simulado, rpa, semana, momento) -> Dict:
+    m = _motor()
+    tags = _tags(perfil_simulado)
+    ctx = pf.Contexto() if anonimo else _contexto(cid, prefs)
+    p = _perfil(cid, prefs, ctx, tags, momento)
+    cfg = pv.montar_config(p)
+    v = m.vitrine(cid, prefs=prefs, data_ref=semana, tags_forcadas=tags, rpa=rpa,
+                  tamanhos=cfg["tamanhos"], extras=cfg["extras"],
+                  excluir_servicos=ctx.servicos_em_pedidos(), tags_extra=p.tags_inferidas,
+                  feedback=ctx.feedback)
+    return {
+        "cidadao_id": None if anonimo else cid,
+        "anonimo": anonimo,
+        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
+        "data_referencia": (semana or m.ref).isoformat(),
+        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
+        "preferencias": prefs.__dict__,
+        "perfil": p.publico(),
+        "ui": cfg["ui"],
+        "layout": pv.montar_layout(m, cfg, v, p, ctx),
+        "secoes": v["secoes"],
+        "avisos": v["avisos"],
+    }
+
+
+def _recomendacoes(cid: str, anonimo: bool, prefs: Preferencias, limite, vagas_descoberta, semana,
+                   detalhe, perfil_simulado, rpa) -> Dict:
+    m = _motor()
+    tags = _tags(perfil_simulado)
+    ctx = pf.Contexto() if anonimo else _contexto(cid, prefs)
+    p = _perfil(cid, prefs, ctx, tags)
+    itens = m.recomendar(cid, limite=limite, prefs=prefs, vagas_descoberta=vagas_descoberta,
+                         data_ref=semana, detalhe=detalhe, tags_forcadas=tags, rpa=rpa,
+                         tags_extra=p.tags_inferidas, feedback=ctx.feedback)
+    return {
+        "cidadao_id": None if anonimo else cid,
+        "anonimo": anonimo,
+        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
+        "data_referencia": (semana or m.ref).isoformat(),
+        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
+        "preferencias": prefs.__dict__,
+        "itens": itens,
+    }
+
+
+@app.get("/vitrine", tags=["Personalização"], summary="Vitrine anônima (sem id)",
          response_model=sc.VitrineOut, response_model_exclude_unset=True, responses=sc.RESP_422)
+def vitrine_anonima(
+    perfil_simulado: Optional[sc.PerfilSimulado] = Query(None, description="Força o perfil do visitante."),
+    rpa: Optional[int] = Query(None, ge=1, le=6, description="Região (RPA 1 a 6). Sem ela, não há seção regional."),
+    semana: Optional[date] = Query(None, description="Data de referência da sazonalidade (AAAA-MM-DD)."),
+    momento: Optional[sc.Momento] = Query(None, description="Força o momento."),
+    usar_perfil: bool = Query(True, description="False ignora `perfil_simulado`."),
+    usar_bairro: bool = Query(True, description="False desliga a seção regional."),
+    usar_sazonalidade: bool = Query(True, description="False desliga a seção de época."),
+) -> Dict:
+    """Vitrine adaptada ao perfil, para quem não tem cadastro ou não está logado.
+
+    * `perfil`: tipo, momento, maturidade digital e temas de foco (aqui, `geral` e `novo`,
+      a menos que `perfil_simulado` ou `momento` sejam informados).
+    * `layout`: seções na ordem certa para esse perfil, sem as vazias. **Use este campo.**
+    * `ui`: dicas de densidade e simplicidade de texto.
+    * `secoes`/`avisos`: formato anterior, mantido por compatibilidade.
+
+    **Visitante**: não recebe id e nada é guardado no servidor (sem histórico, pedidos ou feedback).
+    O front guarda as escolhas do visitante e as envia nos parâmetros `usar_*`. Sem `rpa` nem
+    `perfil_simulado`, a vitrine usa só popularidade, qualidade e sazonalidade."""
+    prefs = Preferencias(usar_perfil=usar_perfil, usar_bairro=usar_bairro, usar_sazonalidade=usar_sazonalidade)
+    return _vitrine(ID_ANONIMO, True, prefs, perfil_simulado, rpa, semana, momento)
+
+
+@app.get("/vitrine/{cid}", tags=["Personalização"], summary="Vitrine da home",
+         response_model=sc.VitrineOut, response_model_exclude_unset=True,
+         responses={**sc.RESP_404, **sc.RESP_422})
 def vitrine(
     cid: str,
     perfil_simulado: Optional[sc.PerfilSimulado] = Query(None, description="Modo demonstração: força o perfil."),
     rpa: Optional[int] = Query(None, ge=1, le=6, description="Modo demonstração: força a região (RPA 1 a 6)."),
     semana: Optional[date] = Query(None, description="Data de referência da sazonalidade (AAAA-MM-DD)."),
+    momento: Optional[sc.Momento] = Query(None, description="Modo demonstração: força o momento."),
 ) -> Dict:
-    """Quatro seções da home: `para_voce_agora` (5), `na_sua_regiao` (3), `em_alta_nesta_epoca` (3)
-    e `descubra` (2). Nenhum serviço se repete nem vem do histórico do cidadão. Seções desligadas
-    nas preferências voltam vazias, com o motivo em `avisos`."""
-    m = _motor()
-    prefs = _prefs(cid)
-    tags = _tags(perfil_simulado)
-    v = m.vitrine(cid, prefs=prefs, data_ref=semana, tags_forcadas=tags, rpa=rpa)
-    return {
-        "cidadao_id": cid,
-        "anonimo": cid not in m.cid,
-        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
-        "data_referencia": (semana or m.ref).isoformat(),
-        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
-        "preferencias": prefs.__dict__,
-        **v,
-    }
+    """Vitrine do cidadão cadastrado. Id fora do cadastro devolve **404**; para visitantes use `GET /vitrine`."""
+    _exigir_cidadao(cid)
+    return _vitrine(cid, False, _prefs(cid), perfil_simulado, rpa, semana, momento)
+
+
+@app.get("/recomendacoes", tags=["Personalização"], summary="Recomendações anônimas (sem id)",
+         response_model=sc.RecomendacoesOut, response_model_exclude_unset=True, responses=sc.RESP_422)
+def recomendacoes_anonimas(
+    limite: int = Query(10, ge=1, le=10, description="Quantidade de itens."),
+    vagas_descoberta: int = Query(1, ge=0, le=3, description="Vagas reservadas a serviços pouco conhecidos."),
+    semana: Optional[date] = Query(None, description="Data de referência da sazonalidade (AAAA-MM-DD)."),
+    detalhe: bool = Query(False, description="Inclui `sinais`, `pesos` e `score` de cada item (depuração)."),
+    perfil_simulado: Optional[sc.PerfilSimulado] = Query(None, description="Força o perfil do visitante."),
+    rpa: Optional[int] = Query(None, ge=1, le=6, description="Região (RPA 1 a 6)."),
+    usar_perfil: bool = Query(True, description="False ignora `perfil_simulado`."),
+    usar_bairro: bool = Query(True, description="False ignora `rpa`."),
+    usar_sazonalidade: bool = Query(True, description="False desliga a sazonalidade."),
+) -> Dict:
+    """Lista para visitante, sem id. Nada é guardado no servidor."""
+    prefs = Preferencias(usar_perfil=usar_perfil, usar_bairro=usar_bairro, usar_sazonalidade=usar_sazonalidade)
+    return _recomendacoes(ID_ANONIMO, True, prefs, limite, vagas_descoberta, semana, detalhe,
+                          perfil_simulado, rpa)
 
 
 @app.get("/cidadaos/{cid}/recomendacoes", tags=["Personalização"], summary="Recomendações em lista",
-         response_model=sc.RecomendacoesOut, response_model_exclude_unset=True, responses=sc.RESP_422)
+         response_model=sc.RecomendacoesOut, response_model_exclude_unset=True,
+         responses={**sc.RESP_404, **sc.RESP_422})
 def recomendacoes(
     cid: str,
     limite: int = Query(10, ge=1, le=10, description="Quantidade de itens."),
@@ -210,21 +326,10 @@ def recomendacoes(
     rpa: Optional[int] = Query(None, ge=1, le=6, description="Modo demonstração (RPA 1 a 6)."),
 ) -> Dict:
     """Lista ordenada de serviços com o motivo de cada um. Nunca inclui serviços já usados.
-    Cidadão desconhecido é tratado como visitante (`anonimo: true`)."""
-    m = _motor()
-    prefs = _prefs(cid)
-    tags = _tags(perfil_simulado)
-    itens = m.recomendar(cid, limite=limite, prefs=prefs, vagas_descoberta=vagas_descoberta,
-                         data_ref=semana, detalhe=detalhe, tags_forcadas=tags, rpa=rpa)
-    return {
-        "cidadao_id": cid,
-        "anonimo": cid not in m.cid,
-        "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
-        "data_referencia": (semana or m.ref).isoformat(),
-        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
-        "preferencias": prefs.__dict__,
-        "itens": itens,
-    }
+    Id fora do cadastro devolve **404**; para visitantes use `GET /recomendacoes`."""
+    _exigir_cidadao(cid)
+    return _recomendacoes(cid, False, _prefs(cid), limite, vagas_descoberta, semana, detalhe,
+                          perfil_simulado, rpa)
 
 
 # ----------------------------------------------------------------- servicos
@@ -265,9 +370,10 @@ def criar_pedido(body: sc.PedidoIn) -> Dict:
 
 
 @app.get("/cidadaos/{cid}/pedidos", tags=["Pedidos"], summary="Pedidos do cidadão",
-         response_model=List[sc.PedidoOut])
+         response_model=List[sc.PedidoOut], responses=sc.RESP_404)
 def listar_pedidos(cid: str) -> List[Dict]:
-    """Do mais recente para o mais antigo."""
+    """Do mais recente para o mais antigo. Id fora do cadastro devolve 404."""
+    _exigir_cidadao(cid)
     return db.listar_pedidos(cid)
 
 

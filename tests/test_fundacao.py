@@ -73,8 +73,8 @@ def test_validacao_422_padronizada(client):
 def test_recomendacoes_cidadao_conhecido_e_anonimo(client):
     r = client.get(f"/cidadaos/{CID}/recomendacoes")
     assert r.status_code == 200 and r.json()["itens"]
-    anon = client.get("/cidadaos/VISITANTE_ANONIMO/recomendacoes").json()
-    assert anon["anonimo"] is True and anon["itens"]
+    anon = client.get("/recomendacoes").json()
+    assert anon["anonimo"] is True and anon["cidadao_id"] is None and anon["itens"]
 
 
 def test_sem_consentimento_nenhum_motivo_cita_saude(client):

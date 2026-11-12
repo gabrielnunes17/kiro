@@ -10,7 +10,7 @@ PERSONAS: List[Dict] = [
      "resumo": "Mulher, 42 anos, RPA 6; empreendedora, MEI, aceita avisos."},
     {"cidadao_id": "C059592", "rotulo": "Pessoa com deficiência", "perfil_simulado": "pcd",
      "resumo": "Mulher, 63 anos, RPA 5; pessoa com deficiência, Cadastro Único, aceita avisos."},
-    {"cidadao_id": "C036462", "rotulo": "Jovem estudante", "perfil_simulado": None,
+    {"cidadao_id": "C036462", "rotulo": "Jovem estudante", "perfil_simulado": "jovem_estudante",
      "resumo": "Mulher, 19 anos, RPA 2; estudante, aceita avisos."},
     {"cidadao_id": "C039227", "rotulo": "Família no Cadastro Único", "perfil_simulado": "familia",
      "resumo": "Homem, 26 anos, RPA 4; Cadastro Único, Bolsa Família, aceita avisos."},
@@ -30,4 +30,5 @@ PERFIS_SIMULADOS: Dict[str, List[str]] = {
     "empreendedor": ["empreendedor"],
     "pcd": ["pcd"],
     "familia": ["vulnerabilidade", "crianca_pequena", "crianca_escolar"],
+    "jovem_estudante": ["jovem", "estudante"],
 }

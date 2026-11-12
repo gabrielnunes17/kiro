@@ -405,9 +405,13 @@ class Motor:
 
     # ----------------------------------------------------------------- score
     def _calcular(self, cidadao_id: str, prefs: Preferencias, ref: date,
-                  tags_forcadas: Optional[List[str]] = None, rpa: Optional[int] = None) -> Dict:
+                  tags_forcadas: Optional[List[str]] = None, rpa: Optional[int] = None,
+                  tags_extra: Optional[List[str]] = None,
+                  feedback: Optional[Dict[int, float]] = None) -> Dict:
         """tags_forcadas/rpa: modo demonstracao. Substituem as tags e a RPA derivadas do cadastro.
-        Tags de saude nunca sao forcadas, e usar_perfil=False continua valendo."""
+        Tags de saude nunca sao forcadas, e usar_perfil=False continua valendo.
+        tags_extra: tags inferidas do comportamento (somam-se as do cadastro, nunca de saude).
+        feedback: {servico_id: fator} vindo de cliques, abandonos e notas do proprio cidadao."""
         c = self.cid.get(cidadao_id)
         tags_todas = self.tags_all.get(cidadao_id, [])
         if tags_forcadas:
@@ -416,6 +420,8 @@ class Motor:
             tags = [t for t in tags_todas if (prefs.consentimento_saude or t not in TAGS_SAUDE)]
         if not prefs.usar_perfil:
             tags = []
+        elif tags_extra:
+            tags = tags + [t for t in tags_extra if t not in tags and t not in TAGS_SAUDE]
         rpa_ef = rpa if rpa is not None else (int(c["rpa"]) if c else None)
         h = self.hist.get(cidadao_id) if prefs.usar_historico else None
         wvec = np.zeros(self.n)
@@ -490,6 +496,12 @@ class Motor:
         final = base * (1.0 + beta * sin["perfil"])
         # servicos de publico especifico sem aderencia ao cidadao perdem forca
         ajuste = np.where(self.restrito & ~match, 0.45, 1.0) * self.fator_digital
+        if feedback and prefs.usar_historico:
+            fb = np.ones(self.n)
+            for sid, f in feedback.items():
+                if int(sid) in self.sid2idx:
+                    fb[self.sid2idx[int(sid)]] = f
+            ajuste = ajuste * fb  # final e disc multiplicam por ajuste logo abaixo
         final = final * ajuste
 
         pesos_d = dict(pesos)
@@ -596,10 +608,11 @@ class Motor:
     def recomendar(self, cidadao_id: str, limite: int = 10, prefs: Optional[Preferencias] = None,
                    vagas_descoberta: int = 1, data_ref: Optional[date] = None,
                    detalhe: bool = False, tags_forcadas: Optional[List[str]] = None,
-                   rpa: Optional[int] = None) -> List[Dict]:
+                   rpa: Optional[int] = None, tags_extra: Optional[List[str]] = None,
+                   feedback: Optional[Dict[int, float]] = None) -> List[Dict]:
         prefs = prefs or Preferencias()
         ref = data_ref or self.ref
-        x = self._calcular(cidadao_id, prefs, ref, tags_forcadas, rpa)
+        x = self._calcular(cidadao_id, prefs, ref, tags_forcadas, rpa, tags_extra, feedback)
         elegivel = ~x["conhecidos"]
         ordem = self._ranquear(np.where(elegivel, x["final"], -1.0))
 
@@ -633,13 +646,22 @@ class Motor:
 
     def vitrine(self, cidadao_id: str, prefs: Optional[Preferencias] = None,
                 data_ref: Optional[date] = None, tags_forcadas: Optional[List[str]] = None,
-                rpa: Optional[int] = None) -> Dict:
-        """Secoes da home. Nenhum servico se repete entre secoes nem vem do historico do cidadao."""
+                rpa: Optional[int] = None, tamanhos: Optional[Dict[str, int]] = None,
+                extras: Optional[List[Dict]] = None, excluir_servicos: Optional[set] = None,
+                tags_extra: Optional[List[str]] = None,
+                feedback: Optional[Dict[int, float]] = None) -> Dict:
+        """Secoes da home. Nenhum servico se repete entre secoes nem vem do historico do cidadao.
+
+        tamanhos: sobrescreve VITRINE_TAMANHOS. excluir_servicos: ids que ficam fora de todas as
+        secoes (ex.: servicos de pedidos em andamento). extras: secoes de afinidade, cada uma
+        {"id", "tags": [...], "tamanho"}, preenchidas depois das quatro secoes base."""
         prefs = prefs or Preferencias()
-        x = self._calcular(cidadao_id, prefs, data_ref or self.ref, tags_forcadas, rpa)
+        x = self._calcular(cidadao_id, prefs, data_ref or self.ref, tags_forcadas, rpa,
+                           tags_extra, feedback)
         elegivel = ~x["conhecidos"]
-        estado = {"set": set(), "pref": {}, "tema": {}}
-        tam = self.VITRINE_TAMANHOS
+        estado = {"set": {self.sid2idx[int(i)] for i in (excluir_servicos or ()) if int(i) in self.sid2idx},
+                  "pref": {}, "tema": {}}
+        tam = {**self.VITRINE_TAMANHOS, **(tamanhos or {})}
         avisos: Dict[str, str] = {}
         secoes: Dict[str, List[Dict]] = {}
 
@@ -682,8 +704,21 @@ class Motor:
             secoes["em_alta_nesta_epoca"] = []
             avisos["em_alta_nesta_epoca"] = "sazonalidade_desligada"
 
+        # 5) Secoes de afinidade (ex.: "Para o seu negocio"): servicos cujo publico-alvo bate
+        #    com as tags da secao, ordenados pelo score do cidadao.
+        extras_out: Dict[str, List[Dict]] = {}
+        for spec in extras or []:
+            mask = np.zeros(self.n, dtype=bool)
+            for t in spec["tags"]:
+                if t in self.tag_srv:
+                    mask |= self.tag_srv[t]
+            ordem_e = self._ranquear(np.where(elegivel & mask, x["final"], -1.0))
+            montar(spec["id"], self._escolher(ordem_e, spec["tamanho"], estado, set()),
+                   "afinidade", "perfil")
+            extras_out[spec["id"]] = secoes.pop(spec["id"])
+
         ordem_chaves = ["para_voce_agora", "na_sua_regiao", "em_alta_nesta_epoca", "descubra"]
-        return {"secoes": {k: secoes[k] for k in ordem_chaves}, "avisos": avisos}
+        return {"secoes": {k: secoes[k] for k in ordem_chaves}, "extras": extras_out, "avisos": avisos}
 
     def _principal_desc(self, s: int, x: Dict) -> str:
         contrib = {"perfil": x["sin"]["perfil"][s], "conteudo": x["sin"]["conteudo"][s],
