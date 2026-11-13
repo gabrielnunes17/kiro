@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -207,6 +207,26 @@ def gravar_preferencias(cid: str, body: sc.Preferencias) -> Dict:
     return dados
 
 
+@app.post("/cidadaos/{cid}/historico", tags=["Cidadão"], summary="Registrar acesso a um serviço",
+          status_code=201, response_model=sc.AcessoOut,
+          responses={200: {"model": sc.AcessoOut, "description": "Não salvo: `usar_historico` desligado."},
+                     **sc.RESP_404, **sc.RESP_422})
+def registrar_acesso(cid: str, body: sc.AcessoIn, response: Response) -> Dict:
+    """Chame quando o cidadão abrir um serviço. Na próxima vitrine, ele aparece primeiro em
+    `historico` e deixa de ser sugerido nas outras seções.
+
+    * Acessar o mesmo serviço de novo só o move para o topo (não duplica).
+    * Com `usar_historico = false` nada é gravado: devolve **200** com `salvo: false`.
+    * Id fora do cadastro ou serviço inexistente devolve **404**. Visitantes não têm histórico."""
+    _exigir_cidadao(cid)
+    _exigir_servico(body.servico_id)
+    if not _prefs(cid).usar_historico:
+        response.status_code = 200
+        return {"cidadao_id": cid, "servico_id": body.servico_id, "salvo": False, "acessado_em": None}
+    r = db.gravar_acesso(cid, body.servico_id)
+    return {"cidadao_id": cid, "servico_id": r["servico_id"], "salvo": True, "acessado_em": r["criado_em"]}
+
+
 # ----------------------------------------------------------- personalizacao
 def _vitrine(cid: str, anonimo: bool, prefs: Preferencias, perfil_simulado, rpa, semana, momento) -> Dict:
     m = _motor()
@@ -214,22 +234,29 @@ def _vitrine(cid: str, anonimo: bool, prefs: Preferencias, perfil_simulado, rpa,
     ctx = pf.Contexto() if anonimo else _contexto(cid, prefs)
     p = _perfil(cid, prefs, ctx, tags, momento)
     cfg = pv.montar_config(p)
+    # Acessos registrados pelo app: entram no historico e saem das recomendacoes.
+    acessos = db.acessos_recentes(cid) if not anonimo and prefs.usar_historico else []
     v = m.vitrine(cid, prefs=prefs, data_ref=semana, tags_forcadas=tags, rpa=rpa,
-                  tamanhos=cfg["tamanhos"], extras=cfg["extras"],
-                  excluir_servicos=ctx.servicos_em_pedidos(), tags_extra=p.tags_inferidas,
-                  feedback=ctx.feedback)
+                  tamanhos=cfg["tamanhos"], excluir_servicos=set(ctx.servicos_em_pedidos()) | set(acessos),
+                  tags_extra=p.tags_inferidas, feedback=ctx.feedback)
+    historico = [] if anonimo else m.historico(cid, prefs, cfg["tamanhos"]["historico"], acessos)
+    s = v["secoes"]
+    avisos = {("em_alta" if k == "em_alta_nesta_epoca" else k): a for k, a in v["avisos"].items()}
+    if not historico:
+        avisos["historico"] = "historico_desligado" if not prefs.usar_historico else "sem_historico"
     return {
         "cidadao_id": None if anonimo else cid,
         "anonimo": anonimo,
         "perfil_simulado": perfil_simulado.value if perfil_simulado else None,
         "data_referencia": (semana or m.ref).isoformat(),
-        "perfis_ativos": m.perfis_ativos(cid, prefs, tags),
-        "preferencias": prefs.__dict__,
         "perfil": p.publico(),
         "ui": cfg["ui"],
-        "layout": pv.montar_layout(m, cfg, v, p, ctx),
-        "secoes": v["secoes"],
-        "avisos": v["avisos"],
+        "descubra": s["descubra"],
+        "historico": historico,
+        "para_voce": s["para_voce_agora"],
+        "na_sua_regiao": s["na_sua_regiao"],
+        "em_alta": s["em_alta_nesta_epoca"],
+        "avisos": avisos,
     }
 
 
@@ -268,9 +295,10 @@ def vitrine_anonima(
 
     * `perfil`: tipo, momento, maturidade digital e temas de foco (aqui, `geral` e `novo`,
       a menos que `perfil_simulado` ou `momento` sejam informados).
-    * `layout`: seções na ordem certa para esse perfil, sem as vazias. **Use este campo.**
+    * `descubra`, `historico`, `para_voce`, `na_sua_regiao`, `em_alta`: as cinco seções, sempre
+      presentes (lista vazia quando desligadas) e sem serviço repetido entre elas.
     * `ui`: dicas de densidade e simplicidade de texto.
-    * `secoes`/`avisos`: formato anterior, mantido por compatibilidade.
+    * `avisos`: por que uma seção veio vazia. Visitante nunca tem `historico`.
 
     **Visitante**: não recebe id e nada é guardado no servidor (sem histórico, pedidos ou feedback).
     O front guarda as escolhas do visitante e as envia nos parâmetros `usar_*`. Sem `rpa` nem

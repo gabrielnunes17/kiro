@@ -574,12 +574,10 @@ class Motor:
                 escolhidos.append(s)
         return escolhidos
 
-    def _item(self, pos: int, s: int, tipo: str, principal: str, x: Dict, detalhe: bool = False) -> Dict:
-        motivo = self._motivo(s, x, principal)
-        if tipo == "descoberta":
-            motivo = "Descoberta: " + motivo[0].lower() + motivo[1:]
+    def _ficha(self, pos: int, s: int) -> Dict:
+        """Campos do servico comuns a todo item de vitrine ou recomendacao."""
         r = self.sv.iloc[s]
-        item = {
+        return {
             "posicao": pos,
             "servico_id": int(self.ids[s]),
             "nome": self.nome[s],
@@ -589,11 +587,19 @@ class Motor:
             "gratuito": str(r["gratuito"]).lower() == "true",
             "nivel_digital": None if np.isnan(self.nivel[s]) else int(self.nivel[s]),
             "canal_app": r["canal_app"] or None,
+        }
+
+    def _item(self, pos: int, s: int, tipo: str, principal: str, x: Dict, detalhe: bool = False) -> Dict:
+        motivo = self._motivo(s, x, principal)
+        if tipo == "descoberta":
+            motivo = "Descoberta: " + motivo[0].lower() + motivo[1:]
+        item = self._ficha(pos, s)
+        item.update({
             "motivo": motivo,
             "sinal_principal": principal,
             "tipo": tipo,
             "novo": True if x["usar_historico"] else None,
-        }
+        })
         if detalhe:
             item["sinais"] = {k: round(float(x["sin"][k][s]), 3) for k in SINAIS}
             item["pesos"] = {k: round(float(v), 3) for k, v in x["pesos"].items()}
@@ -719,6 +725,40 @@ class Motor:
 
         ordem_chaves = ["para_voce_agora", "na_sua_regiao", "em_alta_nesta_epoca", "descubra"]
         return {"secoes": {k: secoes[k] for k in ordem_chaves}, "extras": extras_out, "avisos": avisos}
+
+    def historico(self, cidadao_id: str, prefs: Optional[Preferencias] = None, limite: int = 5,
+                  acessos: Optional[List[int]] = None) -> List[Dict]:
+        """Servicos que o cidadao ja usou, do mais recente ao mais antigo, sem repeticao.
+
+        acessos: ids registrados pelo app (mais recente primeiro). Vem antes do historico da base,
+        que e anterior a data de referencia. Vazio com usar_historico desligado. Servicos de saude
+        so saem com consentimento_saude."""
+        prefs = prefs or Preferencias()
+        if not prefs.usar_historico:
+            return []
+        ordem: List[int] = [self.sid2idx[int(i)] for i in (acessos or []) if int(i) in self.sid2idx]
+        if cidadao_id in self.hist:
+            idx, w = self.hist[cidadao_id]
+            recente: Dict[int, float] = {}
+            for s, peso in zip(idx.tolist(), w.tolist()):
+                if peso > recente.get(s, -1.0):
+                    recente[s] = peso
+            ordem += sorted(recente, key=lambda k: (-recente[k], k))
+        itens: List[Dict] = []
+        vistos: set = set()
+        for s in ordem:
+            if s in vistos:
+                continue
+            vistos.add(s)
+            if not prefs.consentimento_saude and any(t.startswith("Saúde") for t in self.temas[s]):
+                continue
+            item = self._ficha(len(itens) + 1, s)
+            item.update({"motivo": "Você já usou este serviço.", "sinal_principal": "historico",
+                         "tipo": "historico", "novo": False})
+            itens.append(item)
+            if len(itens) >= limite:
+                break
+        return itens
 
     def _principal_desc(self, s: int, x: Dict) -> str:
         contrib = {"perfil": x["sin"]["perfil"][s], "conteudo": x["sin"]["conteudo"][s],

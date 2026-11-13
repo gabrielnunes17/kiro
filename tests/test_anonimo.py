@@ -7,6 +7,7 @@ from tests.conftest import CID
 
 DESCONHECIDO = "NAO_EXISTE"
 
+SECOES = ["descubra", "historico", "para_voce", "na_sua_regiao", "em_alta"]
 ROTAS_COM_ID = [
     "/vitrine/{}", "/cidadaos/{}/recomendacoes", "/cidadaos/{}/perfil", "/cidadaos/{}/tipo-perfil",
     "/cidadaos/{}/preferencias", "/cidadaos/{}/pedidos",
@@ -37,28 +38,27 @@ def test_vitrine_anonima_sem_id(client):
     v = r.json()
     assert v["anonimo"] is True and v["cidadao_id"] is None
     assert v["perfil"]["tipo"] == "geral" and v["perfil"]["momento"] == "novo"
-    assert v["layout"] and v["layout"][0]["titulo"] == "Comece por aqui"
+    assert v["descubra"] and v["para_voce"] and v["historico"] == []
     assert v["avisos"]["na_sua_regiao"] == "regiao_desconhecida"
-    ids = [i["servico_id"] for s in v["layout"] for i in s["itens"]]
+    assert v["avisos"]["historico"] == "sem_historico"
+    ids = [i["servico_id"] for s in SECOES for i in v[s]]
     assert len(ids) == len(set(ids))
 
 
 def test_vitrine_anonima_com_regiao_e_perfil_simulado(client):
     v = client.get("/vitrine", params={"rpa": 3, "perfil_simulado": "empreendedor"}).json()
     assert v["perfil"]["tipo"] == "empreendedor" and v["perfil"]["origem"] == "simulado"
-    ids = [s["id"] for s in v["layout"]]
-    assert "na_sua_regiao" in ids and "para_o_seu_negocio" in ids
-    assert all("RPA 3" in i["motivo"] for s in v["layout"] if s["id"] == "na_sua_regiao" for i in s["itens"])
+    assert v["na_sua_regiao"]
+    assert all("RPA 3" in i["motivo"] for i in v["na_sua_regiao"])
 
 
 def test_vitrine_anonima_preferencias_por_parametro(client):
     v = client.get("/vitrine", params={"rpa": 3, "perfil_simulado": "pcd", "usar_perfil": False,
                                        "usar_bairro": False, "usar_sazonalidade": False}).json()
-    assert v["perfil"]["tipo"] == "geral" and v["perfis_ativos"] == []
-    ids = [s["id"] for s in v["layout"]]
-    assert "na_sua_regiao" not in ids and "em_alta_nesta_epoca" not in ids
+    assert v["perfil"]["tipo"] == "geral"
+    assert v["na_sua_regiao"] == [] and v["em_alta"] == []
     assert v["avisos"]["na_sua_regiao"] == "regiao_desligada"
-    assert v["preferencias"]["usar_bairro"] is False
+    assert v["avisos"]["em_alta"] == "sazonalidade_desligada"
 
 
 def test_vitrine_anonima_valida_parametros(client):
@@ -92,10 +92,8 @@ def test_anonimo_nao_herda_estado_de_nenhum_cidadao(client):
         "usar_bairro": False, "usar_sazonalidade": False})
     client.post("/pedidos", json={"cidadao_id": CID, "servico_id": 953})
     v = client.get("/vitrine", params={"rpa": 3}).json()
-    assert v["preferencias"] == {"consentimento_saude": False, "usar_historico": True, "usar_perfil": True,
-                                 "usar_bairro": True, "usar_sazonalidade": True}
-    assert v["perfil"]["momento"] == "novo"
-    assert all(s["tipo_secao"] == "recomendacao" for s in v["layout"])
+    assert v["perfil"]["momento"] == "novo" and v["historico"] == []
+    assert v["na_sua_regiao"] and v["em_alta"]
 
 
 def test_swagger_lista_rotas_anonimas_e_404(client):
@@ -105,3 +103,5 @@ def test_swagger_lista_rotas_anonimas_e_404(client):
     assert "404" in spec["paths"]["/cidadaos/{cid}/preferencias"]["get"]["responses"]
     props = spec["components"]["schemas"]["VitrineOut"]["properties"]
     assert "anyOf" in props["cidadao_id"]  # aceita null
+    assert {"descubra", "historico", "para_voce", "na_sua_regiao", "em_alta"} <= set(props)
+    assert not {"layout", "secoes"} & set(props)

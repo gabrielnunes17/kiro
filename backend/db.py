@@ -1,6 +1,6 @@
 """Persistencia em SQLite (stdlib). Uma conexao por operacao: seguro com varios workers.
 
-Tabelas: preferencias, pedidos, pedido_eventos, eventos_ux, pesquisas.
+Tabelas: preferencias, pedidos, pedido_eventos, eventos_ux, pesquisas, acessos.
 O caminho vem de KODIAK_DB (padrao data/app.db); os testes apontam para um arquivo temporario.
 """
 from __future__ import annotations
@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS pesquisas (
     comentario TEXT,
     criado_em TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS acessos (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    cidadao_id TEXT NOT NULL,
+    servico_id INTEGER NOT NULL,
+    criado_em  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_acessos_cidadao ON acessos(cidadao_id, id);
 CREATE INDEX IF NOT EXISTS ix_eventos_pseudo ON eventos_ux(usuario_pseudo);
 CREATE INDEX IF NOT EXISTS ix_pesquisas_pseudo ON pesquisas(usuario_pseudo);
 """
@@ -205,6 +212,22 @@ def eventos_pedido(pid: int) -> list:
         rs = con.execute("SELECT etapa, status, horas_simuladas, criado_em FROM pedido_eventos "
                          "WHERE pedido_id = ? ORDER BY id", (pid,)).fetchall()
     return [dict(r) for r in rs]
+
+
+# ---------------------------------------------------------------- acessos
+def gravar_acesso(cid: str, servico_id: int) -> Dict:
+    with conexao() as con:
+        cur = con.execute("INSERT INTO acessos (cidadao_id, servico_id) VALUES (?, ?)", (cid, servico_id))
+        r = con.execute("SELECT servico_id, criado_em FROM acessos WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(r)
+
+
+def acessos_recentes(cid: str, limite: int = 50) -> list:
+    """Ids de servico acessados pelo cidadao, do mais recente ao mais antigo, sem repeticao."""
+    with conexao() as con:
+        rs = con.execute("SELECT servico_id, MAX(id) AS ultimo FROM acessos WHERE cidadao_id = ? "
+                         "GROUP BY servico_id ORDER BY ultimo DESC LIMIT ?", (cid, limite)).fetchall()
+    return [r["servico_id"] for r in rs]
 
 
 # -------------------------------------------------- eventos de UX e pesquisas

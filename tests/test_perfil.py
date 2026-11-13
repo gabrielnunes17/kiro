@@ -19,8 +19,11 @@ def tipo_perfil(client, cid, **params):
     return r.json()
 
 
-def itens_do_layout(v):
-    return [i for s in v["layout"] for i in s["itens"]]
+SECOES = ["descubra", "historico", "para_voce", "na_sua_regiao", "em_alta"]
+
+
+def itens_da_vitrine(v):
+    return [i for s in SECOES for i in v[s]]
 
 
 def prefs_put(client, cid, **kw):
@@ -122,93 +125,69 @@ def test_momentos_pelo_historico(client, monkeypatch):
 
 
 # ----------------------------------------------------------- vitrine adaptada
-def test_vitrine_traz_perfil_layout_e_campos_antigos(client):
+def test_vitrine_traz_perfil_ui_e_cinco_secoes(client):
     v = client.get(f"/vitrine/{EMP}").json()
     assert v["perfil"]["tipo"] == "empreendedor"
     assert set(v["ui"]) == {"densidade", "texto_simples"}
-    assert {"para_voce_agora", "na_sua_regiao", "em_alta_nesta_epoca", "descubra"} == set(v["secoes"])
-    assert "avisos" in v and v["layout"]
-    for s in v["layout"]:
-        assert s["itens"] and s["titulo"] and s["subtitulo"]
+    assert set(SECOES) | {"avisos"} <= set(v)
+    assert not {"layout", "secoes"} & set(v)
 
 
-def test_layout_sem_repeticao_e_sem_servico_ja_usado(client):
+def test_vitrine_sem_repeticao_e_sem_servico_ja_usado_fora_do_historico(client):
     m = _estado["motor"]
     for cid in (CID, EMP, PCD, FAM, JOV):
         v = client.get(f"/vitrine/{cid}").json()
-        ids = [i["servico_id"] for i in itens_do_layout(v)]
+        ids = [i["servico_id"] for i in itens_da_vitrine(v)]
         assert len(ids) == len(set(ids)), cid
         if cid in m.hist:
             usados = {int(m.ids[i]) for i in m.hist[cid][0]}
-            assert not usados & set(ids), cid
+            recomendados = {i["servico_id"] for s in SECOES if s != "historico" for i in v[s]}
+            assert not usados & recomendados, cid
+            assert {i["servico_id"] for i in v["historico"]} <= usados, cid
 
 
-def test_layout_muda_conforme_o_tipo(client):
-    ids = {}
+def test_vitrine_muda_conforme_o_tipo(client):
+    para_voce = {}
     for tipo in ("idoso", "empreendedor", "pcd", "familia", "jovem_estudante"):
         v = client.get(f"/vitrine/{EMP}", params={"perfil_simulado": tipo, "momento": "recorrente"}).json()
-        ids[tipo] = [s["id"] for s in v["layout"]]
+        para_voce[tipo] = tuple(i["servico_id"] for i in v["para_voce"])
         assert v["perfil"]["tipo"] == tipo
-    assert "para_o_seu_negocio" in ids["empreendedor"] and "para_o_seu_negocio" not in ids["idoso"]
-    assert "para_a_sua_familia" in ids["familia"]
-    assert "atendimento_para_pcd" in ids["pcd"]
-    assert "para_estudantes_e_jovens" in ids["jovem_estudante"]
-    assert ids["empreendedor"].index("para_o_seu_negocio") < ids["empreendedor"].index("na_sua_regiao")
+    assert len(set(para_voce.values())) == 5
 
 
 def test_idoso_tem_vitrine_simplificada(client):
     v = client.get(f"/vitrine/{CID}", params={"perfil_simulado": "idoso", "momento": "recorrente"}).json()
     assert v["ui"] == {"densidade": "baixa", "texto_simples": True}
-    n = {s["id"]: len(s["itens"]) for s in v["layout"]}
-    assert n["para_voce_agora"] <= 4 and n.get("descubra", 0) <= 1
+    assert len(v["para_voce"]) <= 4 and len(v["descubra"]) <= 1 and len(v["historico"]) <= 3
     base = client.get(f"/vitrine/{CID}", params={"perfil_simulado": "empreendedor",
                                                  "momento": "recorrente"}).json()
     assert base["ui"]["texto_simples"] is False
 
 
 def test_momento_novo_prioriza_descoberta(client):
-    v = client.get("/vitrine", params={"momento": "novo", "rpa": 3}).json()
-    ordem = [s["id"] for s in v["layout"]]
-    assert v["layout"][0]["titulo"] == "Comece por aqui"
-    assert ordem.index("descubra") < ordem.index("na_sua_regiao")
+    novo = client.get("/vitrine", params={"momento": "novo", "rpa": 3}).json()
     rec = client.get("/vitrine", params={"momento": "recorrente", "rpa": 3}).json()
-    assert rec["layout"][0]["titulo"] == "Seu próximo passo"
+    assert len(novo["descubra"]) > len(rec["descubra"])
+    assert len(novo["para_voce"]) < len(rec["para_voce"])
 
 
-def test_preferencias_desligadas_saem_do_layout(client):
+def test_preferencias_desligadas_esvaziam_secoes(client):
     prefs_put(client, EMP, usar_bairro=False, usar_sazonalidade=False)
     v = client.get(f"/vitrine/{EMP}").json()
-    ids = [s["id"] for s in v["layout"]]
-    assert "na_sua_regiao" not in ids and "em_alta_nesta_epoca" not in ids
+    assert v["na_sua_regiao"] == [] and v["em_alta"] == []
     assert v["avisos"]["na_sua_regiao"] == "regiao_desligada"
+    assert v["avisos"]["em_alta"] == "sazonalidade_desligada"
 
 
 # ------------------------------------------------------------ pedidos (retomada)
-def test_rascunho_gera_retomada_e_nao_repete_servico(client):
+def test_pedido_em_andamento_nao_volta_como_recomendacao(client):
     r = client.post("/pedidos", json={"cidadao_id": EMP, "servico_id": SID})
     pid = r.json()["id"]
     client.patch(f"/pedidos/{pid}", json={"ultimo_passo": 2})
     assert tipo_perfil(client, EMP)["momento"] == "retomada"
     v = client.get(f"/vitrine/{EMP}").json()
-    topo = v["layout"][0]
-    assert topo["id"] == "continue_de_onde_parou" and topo["tipo_secao"] == "pedido"
-    item = topo["itens"][0]
-    assert item["pedido_id"] == pid and item["servico_id"] == SID and item["ultimo_passo"] == 2
-    assert "passo 2" in item["motivo"]
-    outros = [i["servico_id"] for s in v["layout"][1:] for i in s["itens"]]
-    assert SID not in outros
-
-    client.post(f"/pedidos/{pid}/enviar")
-    v = client.get(f"/vitrine/{EMP}").json()
-    assert v["layout"][0]["id"] == "acompanhe_seus_pedidos"
-    assert v["layout"][0]["itens"][0]["protocolo"].startswith("KDK-")
     assert v["perfil"]["momento"] == "retomada"
-
-
-def test_momento_forcado_esconde_secoes_de_pedido(client):
-    client.post("/pedidos", json={"cidadao_id": EMP, "servico_id": SID})
-    v = client.get(f"/vitrine/{EMP}", params={"momento": "recorrente"}).json()
-    assert all(s["tipo_secao"] == "recomendacao" for s in v["layout"])
+    assert SID not in [i["servico_id"] for i in itens_da_vitrine(v)]
 
 
 # ------------------------------------------------------------------- feedback
@@ -257,10 +236,10 @@ def test_cliques_aumentam_e_usar_historico_desligado_ignora_feedback(client):
 
 
 # --------------------------------------------------------------------- swagger
-def test_swagger_documenta_perfil_e_layout(client):
+def test_swagger_documenta_perfil_e_vitrine(client):
     spec = client.get("/openapi.json").json()
     assert "/cidadaos/{cid}/tipo-perfil" in spec["paths"]
     esq = spec["components"]["schemas"]
-    assert "example" in esq["TipoPerfilOut"] and "layout" in esq["VitrineOut"]["properties"]
+    assert "example" in esq["TipoPerfilOut"] and set(SECOES) <= set(esq["VitrineOut"]["properties"])
     ex = esq["VitrineOut"]["example"]
-    assert ex["layout"][0]["id"] == "para_voce_agora" and ex["perfil"]["tipo"] == "empreendedor"
+    assert set(SECOES) <= set(ex) and ex["perfil"]["tipo"] == "empreendedor"

@@ -98,7 +98,7 @@ class Item(BaseModel):
     canal_app: Optional[str] = None
     motivo: str = Field(description="Frase em linguagem simples explicando a sugestão.")
     sinal_principal: str
-    tipo: str = Field(description="para_voce, descoberta, regiao, epoca, afinidade ou pedido.")
+    tipo: str = Field(description="para_voce, descoberta, regiao, epoca, historico, afinidade ou pedido.")
     novo: Optional[bool] = Field(None, description="True se o cidadão ainda não usou (null sem histórico).")
     sinais: Optional[Dict[str, float]] = Field(None, description="Só com detalhe=true.")
     pesos: Optional[Dict[str, float]] = Field(None, description="Só com detalhe=true.")
@@ -172,40 +172,30 @@ class Ui(BaseModel):
     texto_simples: bool = Field(description="True: usar linguagem e telas mais simples.")
 
 
-class SecaoLayout(BaseModel):
-    id: str
-    titulo: str
-    subtitulo: str
-    tipo_secao: str = Field(description="recomendacao ou pedido.")
-    itens: List[Item]
-
-
-class Secoes(BaseModel):
-    para_voce_agora: List[Item]
-    na_sua_regiao: List[Item]
-    em_alta_nesta_epoca: List[Item]
-    descubra: List[Item]
-
-
-class VitrineOut(Contexto):
+class VitrineOut(BaseModel):
+    cidadao_id: Optional[str] = Field(None, description="Null na rota anônima (sem id).")
+    anonimo: bool
+    perfil_simulado: Optional[PerfilSimulado] = None
+    data_referencia: str = Field(description="Data usada na sazonalidade (AAAA-MM-DD).")
     perfil: PerfilTipo = Field(description="Perfil que moldou a vitrine.")
     ui: Ui
-    layout: List[SecaoLayout] = Field(
-        description="Seções na ordem em que devem aparecer, já sem as vazias. Prefira este campo.")
-    secoes: Secoes = Field(description="Seções base por nome (formato anterior, mantido por compatibilidade).")
+    descubra: List[Item] = Field(description="Serviços pouco conhecidos que combinam com o perfil.")
+    historico: List[Item] = Field(description="Serviços que o cidadão já usou, do mais recente ao mais antigo.")
+    para_voce: List[Item] = Field(description="Próximos passos por perfil, uso parecido e histórico.")
+    na_sua_regiao: List[Item] = Field(description="Mais procurados na RPA. Vazio sem região ou com `usar_bairro` desligado.")
+    em_alta: List[Item] = Field(description="Em alta nesta época. Vazio com `usar_sazonalidade` desligado.")
     avisos: Dict[str, str] = Field(
-        description="Seções vazias e o motivo: regiao_desligada, regiao_desconhecida, sazonalidade_desligada.")
+        description="Seção vazia e o motivo. `historico`: sem_historico ou historico_desligado. "
+                    "`na_sua_regiao`: regiao_desligada ou regiao_desconhecida. `em_alta`: sazonalidade_desligada.")
 
     model_config = ConfigDict(json_schema_extra={"example": {
         "cidadao_id": "C068579", "anonimo": False, "perfil_simulado": None,
-        "data_referencia": "2026-09-28", "perfis_ativos": ["empreendedor", "mulher"],
-        "preferencias": Preferencias().model_dump(),
+        "data_referencia": "2026-09-28",
         "perfil": EXEMPLO_PERFIL_TIPO, "ui": {"densidade": "normal", "texto_simples": False},
-        "layout": [{"id": "para_voce_agora", "titulo": "Seu próximo passo",
-                    "subtitulo": "Com base no que você já usou", "tipo_secao": "recomendacao",
-                    "itens": [EXEMPLO_ITEM]}],
-        "secoes": {"para_voce_agora": [EXEMPLO_ITEM], "na_sua_regiao": [], "em_alta_nesta_epoca": [],
-                   "descubra": []},
+        "descubra": [{**EXEMPLO_ITEM, "servico_id": 1475, "tipo": "descoberta", "sinal_principal": "perfil"}],
+        "historico": [{**EXEMPLO_ITEM, "servico_id": 953, "motivo": "Você já usou este serviço.",
+                       "sinal_principal": "historico", "tipo": "historico", "novo": False}],
+        "para_voce": [EXEMPLO_ITEM], "na_sua_regiao": [], "em_alta": [],
         "avisos": {"na_sua_regiao": "regiao_desligada"}}})
 
 
@@ -269,6 +259,23 @@ class Persona(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {
         "cidadao_id": "C068579", "rotulo": "Microempreendedor", "perfil_simulado": "empreendedor",
         "resumo": "Mulher, 42 anos, RPA 6; empreendedora, MEI, aceita avisos."}})
+
+
+# ----------------------------------------------------------------- historico
+class AcessoIn(BaseModel):
+    servico_id: int = Field(description="Serviço que o cidadão acabou de abrir.", examples=[519])
+
+    model_config = ConfigDict(json_schema_extra={"example": {"servico_id": 519}})
+
+
+class AcessoOut(BaseModel):
+    cidadao_id: str
+    servico_id: int
+    salvo: bool = Field(description="False quando o cidadão desligou `usar_historico` (nada é gravado).")
+    acessado_em: Optional[str] = Field(None, description="Data e hora UTC do registro. Null se não salvo.")
+
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "cidadao_id": "C068579", "servico_id": 519, "salvo": True, "acessado_em": "2026-11-12 20:31:05"}})
 
 
 # ----------------------------------------------------------------- pedidos
